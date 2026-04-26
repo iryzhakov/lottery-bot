@@ -57,7 +57,8 @@ func getAppDir() string {
 
 func initDB() {
 	var err error
-	dbPath := filepath.Join(appDir, "lottery.db")
+	// dbPath := filepath.Join(appDir, "lottery.db")
+	dbPath := "/data/lottery.db"
 	db, err = sql.Open("sqlite3", dbPath)
 	if err != nil {
 		log.Fatal(err)
@@ -898,9 +899,13 @@ func main() {
 	appDir = getAppDir()
 	envPath := filepath.Join(appDir, ".env")
 
+	// err := godotenv.Load(envPath)
+	// if err != nil {
+	// 	log.Fatal("Failed to load .env file at:", envPath, "error:", err)
+	// }
 	err := godotenv.Load(envPath)
 	if err != nil {
-		log.Fatal("Failed to load .env file at:", envPath, "error:", err)
+		log.Println("No .env file found, using environment variables")
 	}
 
 	token := os.Getenv("BOT_TOKEN")
