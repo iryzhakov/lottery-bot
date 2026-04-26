@@ -1,0 +1,7 @@
+.env
+lottery.db
+*.db
+*.sqlite
+*.sqlite3
+
+lottery-bot
