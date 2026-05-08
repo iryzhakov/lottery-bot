@@ -27,10 +27,14 @@ var db *sql.DB
 var appDir string
 var envAdmins map[int64]bool
 
-var pendingInputs = make(map[int64]struct {
-	ChatID int64
-	UserID int64
-})
+type pendingInput struct {
+	TargetChatID int64
+	UserID       int64
+	AdminChatID  int64
+	MessageID    int
+}
+
+var pendingInputs = make(map[int64]pendingInput)
 
 func getAppDir() string {
 	ex, err := os.Executable()
@@ -552,11 +556,60 @@ func handleAdmin(update tgbotapi.Update, bot *tgbotapi.BotAPI) {
 	}
 }
 
-func showChats(bot *tgbotapi.BotAPI, chatID int64) { // Показать список чатов с зарегистрированными участниками
+func sendAdminMessage(bot *tgbotapi.BotAPI, chatID int64, text string, buttons [][]tgbotapi.InlineKeyboardButton) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
+	bot.Send(msg)
+}
+
+func editAdminMessage(bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery, text string, buttons [][]tgbotapi.InlineKeyboardButton) {
+	edit := tgbotapi.NewEditMessageTextAndMarkup(
+		callback.Message.Chat.ID,
+		callback.Message.MessageID,
+		text,
+		tgbotapi.NewInlineKeyboardMarkup(buttons...),
+	)
+	bot.Send(edit)
+}
+
+func editAdminMessageByID(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string, buttons [][]tgbotapi.InlineKeyboardButton) {
+	edit := tgbotapi.NewEditMessageTextAndMarkup(
+		chatID,
+		messageID,
+		text,
+		tgbotapi.NewInlineKeyboardMarkup(buttons...),
+	)
+	bot.Send(edit)
+}
+
+func chatButtonTitle(chatID int64) string {
+	return fmt.Sprintf("Чат %d", chatID)
+}
+
+func plainUserName(username string) string {
+	username = strings.TrimSpace(username)
+	if strings.HasPrefix(username, "[") {
+		closeBracket := strings.Index(username, "]")
+		if closeBracket > 1 && strings.HasPrefix(username[closeBracket+1:], "(tg://user?id=") {
+			return username[1:closeBracket]
+		}
+	}
+	return strings.TrimPrefix(username, "@")
+}
+
+func userButtonTitle(username string, weight int, isPaused int) string {
+	status := "active"
+	if isPaused == 1 {
+		status = "paused"
+	}
+	return fmt.Sprintf("%s (вес: %d, %s)", plainUserName(username), weight, status)
+}
+
+func buildChatsView() (string, [][]tgbotapi.InlineKeyboardButton) {
 	rows, err := db.Query("SELECT DISTINCT chat_id FROM participants")
 	if err != nil {
 		log.Println(err)
-		return
+		return "Не получилось загрузить чаты.", nil
 	}
 	defer rows.Close()
 
@@ -567,17 +620,28 @@ func showChats(bot *tgbotapi.BotAPI, chatID int64) { // Показать спи�
 		rows.Scan(&cID)
 
 		btn := tgbotapi.NewInlineKeyboardButtonData(
-			fmt.Sprintf("Чат %d", cID),
+			chatButtonTitle(cID),
 			fmt.Sprintf("chat_%d", cID),
 		)
 
 		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(btn))
 	}
 
-	msg := tgbotapi.NewMessage(chatID, "Выбери чат:")
-	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
+	if len(buttons) == 0 {
+		return "Чатов с участниками пока нет.", nil
+	}
 
-	bot.Send(msg)
+	return "Выбери чат:", buttons
+}
+
+func showChats(bot *tgbotapi.BotAPI, chatID int64) { // Показать список чатов с зарегистрированными участниками
+	text, buttons := buildChatsView()
+	sendAdminMessage(bot, chatID, text, buttons)
+}
+
+func editChats(bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery) {
+	text, buttons := buildChatsView()
+	editAdminMessage(bot, callback, text, buttons)
 }
 
 func showAdmins(bot *tgbotapi.BotAPI, chatID int64, currentAdminID int64) {
@@ -614,7 +678,7 @@ func showAdmins(bot *tgbotapi.BotAPI, chatID int64, currentAdminID int64) {
 	bot.Send(msg)
 }
 
-func showUsers(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64) { // Показать участников выбранного чата
+func buildUsersView(targetChatID int64) (string, [][]tgbotapi.InlineKeyboardButton) {
 	rows, err := db.Query(`
 	SELECT user_id, username, weight, is_paused 
 	FROM participants 
@@ -622,7 +686,7 @@ func showUsers(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64) { // По
 `, targetChatID)
 	if err != nil {
 		log.Println(err)
-		return
+		return "Не получилось загрузить участников.", nil
 	}
 	defer rows.Close()
 
@@ -636,13 +700,8 @@ func showUsers(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64) { // По
 
 		rows.Scan(&userID, &username, &weight, &isPaused)
 
-		status := "▶️ active"
-		if isPaused == 1 {
-			status = "⏸ paused"
-		}
-
 		btn := tgbotapi.NewInlineKeyboardButtonData(
-			fmt.Sprintf("%s (вес: %d, %s)", formatMention(userID, username), weight, status),
+			userButtonTitle(username, weight, isPaused),
 			fmt.Sprintf("user_%d_%d", targetChatID, userID),
 		)
 
@@ -665,13 +724,20 @@ func showUsers(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64) { // По
 	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(resetTimerBtn))
 	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(backBtn))
 
-	msg := tgbotapi.NewMessage(chatID, "Выбери участника:")
-	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
-
-	bot.Send(msg)
+	return fmt.Sprintf("Чат %d\nВыбери участника:", targetChatID), buttons
 }
 
-func showUserControls(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64, userID int64) { // Показать кнопки управления весом для выбранного участника
+func showUsers(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64) { // Показать участников выбранного чата
+	text, buttons := buildUsersView(targetChatID)
+	sendAdminMessage(bot, chatID, text, buttons)
+}
+
+func editUsers(bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery, targetChatID int64) {
+	text, buttons := buildUsersView(targetChatID)
+	editAdminMessage(bot, callback, text, buttons)
+}
+
+func buildUserControlsView(targetChatID int64, userID int64, notice string) (string, [][]tgbotapi.InlineKeyboardButton) {
 	var username string
 	var weight int
 
@@ -684,7 +750,7 @@ func showUserControls(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64, us
 
 	if err != nil {
 		log.Println(err)
-		return
+		return "Не получилось загрузить участника.", nil
 	}
 
 	statusText := "▶️ Активен"
@@ -697,13 +763,31 @@ func showUserControls(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64, us
 		pauseAction = "start"
 	}
 
+	var winsCount int
+
+	err = db.QueryRow(
+		"SELECT COUNT(*) FROM results WHERE chat_id = ? AND user_id = ?",
+		targetChatID,
+		userID,
+	).Scan(&winsCount)
+
+	if err != nil {
+		log.Println(err)
+		return "Не получилось загрузить статистику участника.", nil
+	}
+
 	text := fmt.Sprintf(
-		"%s\nID: %d\nВес: %d\nСтатус: %s",
+		"%s\nID: %d\nВес: %d\nПобед: %d\nСтатус: %s",
 		formatMention(userID, username),
 		userID,
 		weight,
+		winsCount,
 		statusText,
 	)
+
+	if notice != "" {
+		text += "\n\n" + notice
+	}
 
 	buttons := [][]tgbotapi.InlineKeyboardButton{
 		{
@@ -713,6 +797,10 @@ func showUserControls(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64, us
 		{
 			tgbotapi.NewInlineKeyboardButtonData("-10", fmt.Sprintf("weight_%d_%d_-10", targetChatID, userID)),
 			tgbotapi.NewInlineKeyboardButtonData("-1", fmt.Sprintf("weight_%d_%d_-1", targetChatID, userID)),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("-1 победа", fmt.Sprintf("wins_%d_%d_-1", targetChatID, userID)),
+			tgbotapi.NewInlineKeyboardButtonData("+1 победа", fmt.Sprintf("wins_%d_%d_1", targetChatID, userID)),
 		},
 		{
 			tgbotapi.NewInlineKeyboardButtonData("Сброс", fmt.Sprintf("weight_%d_%d_reset", targetChatID, userID)),
@@ -731,19 +819,30 @@ func showUserControls(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64, us
 		},
 	}
 
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
-
-	bot.Send(msg)
+	return text, buttons
 }
 
-func setPendingInput(adminID int64, chatID int64, userID int64) { // Сохранить состояние ожидания ввода веса для конкретного участника
-	pendingInputs[adminID] = struct {
-		ChatID int64
-		UserID int64
-	}{
-		ChatID: chatID,
-		UserID: userID,
+func showUserControls(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64, userID int64) { // Показать кнопки управления весом для выбранного участника
+	text, buttons := buildUserControlsView(targetChatID, userID, "")
+	sendAdminMessage(bot, chatID, text, buttons)
+}
+
+func editUserControls(bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery, targetChatID int64, userID int64) {
+	text, buttons := buildUserControlsView(targetChatID, userID, "")
+	editAdminMessage(bot, callback, text, buttons)
+}
+
+func editUserControlsByID(bot *tgbotapi.BotAPI, chatID int64, messageID int, targetChatID int64, userID int64, notice string) {
+	text, buttons := buildUserControlsView(targetChatID, userID, notice)
+	editAdminMessageByID(bot, chatID, messageID, text, buttons)
+}
+
+func setPendingInput(adminID int64, targetChatID int64, userID int64, adminChatID int64, messageID int) { // Сохранить состояние ожидания ввода веса для конкретного участника
+	pendingInputs[adminID] = pendingInput{
+		TargetChatID: targetChatID,
+		UserID:       userID,
+		AdminChatID:  adminChatID,
+		MessageID:    messageID,
 	}
 }
 
@@ -825,94 +924,6 @@ func addParticipantByAdmin(targetChatID int64, userID int64, username string) st
 	return "Участник добавлен 😈"
 }
 
-// для одного сообщения от бота с редактированием обновлений
-func editUserControls(bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery, targetChatID int64, userID int64) {
-	var username string
-	var weight int
-	var isPaused int
-
-	err := db.QueryRow(
-		"SELECT username, weight, is_paused FROM participants WHERE chat_id = ? AND user_id = ?",
-		targetChatID, userID,
-	).Scan(&username, &weight, &isPaused)
-
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	statusText := "▶️ Активен"
-	pauseButtonText := "⏸ Пауза"
-	pauseAction := "pause"
-
-	if isPaused == 1 {
-		statusText = "⏸ На паузе"
-		pauseButtonText = "▶️ Старт"
-		pauseAction = "start"
-	}
-
-	var winsCount int
-
-	err = db.QueryRow(
-		"SELECT COUNT(*) FROM results WHERE chat_id = ? AND user_id = ?",
-		targetChatID,
-		userID,
-	).Scan(&winsCount)
-
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	text := fmt.Sprintf(
-		"%s\nID: %d\nВес: %d\nПобед: %d\nСтатус: %s",
-		formatMention(userID, username),
-		userID,
-		weight,
-		winsCount,
-		statusText,
-	)
-
-	buttons := [][]tgbotapi.InlineKeyboardButton{
-		{
-			tgbotapi.NewInlineKeyboardButtonData("+10", fmt.Sprintf("weight_%d_%d_10", targetChatID, userID)),
-			tgbotapi.NewInlineKeyboardButtonData("+1", fmt.Sprintf("weight_%d_%d_1", targetChatID, userID)),
-		},
-		{
-			tgbotapi.NewInlineKeyboardButtonData("-10", fmt.Sprintf("weight_%d_%d_-10", targetChatID, userID)),
-			tgbotapi.NewInlineKeyboardButtonData("-1", fmt.Sprintf("weight_%d_%d_-1", targetChatID, userID)),
-		},
-		{
-			tgbotapi.NewInlineKeyboardButtonData("-1 победа", fmt.Sprintf("wins_%d_%d_-1", targetChatID, userID)),
-			tgbotapi.NewInlineKeyboardButtonData("+1 победа", fmt.Sprintf("wins_%d_%d_1", targetChatID, userID)),
-		},
-		{
-			tgbotapi.NewInlineKeyboardButtonData("Сброс", fmt.Sprintf("weight_%d_%d_reset", targetChatID, userID)),
-		},
-		{
-			tgbotapi.NewInlineKeyboardButtonData(
-				pauseButtonText,
-				fmt.Sprintf("status_%d_%d_%s", targetChatID, userID, pauseAction),
-			),
-		},
-		{
-			tgbotapi.NewInlineKeyboardButtonData("Введи значение", fmt.Sprintf("weight_%d_%d_add", targetChatID, userID)),
-		},
-		{
-			tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", fmt.Sprintf("back_%d", targetChatID)),
-		},
-	}
-
-	edit := tgbotapi.NewEditMessageTextAndMarkup(
-		callback.Message.Chat.ID,
-		callback.Message.MessageID,
-		text,
-		tgbotapi.NewInlineKeyboardMarkup(buttons...),
-	)
-
-	bot.Send(edit)
-}
-
 func main() {
 	appDir = getAppDir()
 	envPath := filepath.Join(appDir, ".env")
@@ -980,17 +991,16 @@ func main() {
 				continue
 			}
 			if data == "goback" {
-				cb := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
-				bot.Request(cb)
-
-				showChats(bot, update.CallbackQuery.Message.Chat.ID)
+				editChats(bot, update.CallbackQuery)
+				continue
 			}
 
 			if strings.HasPrefix(data, "chat_") {
 				parts := strings.Split(data, "_")
 				targetChatID, _ := strconv.ParseInt(parts[1], 10, 64)
 
-				showUsers(bot, update.CallbackQuery.Message.Chat.ID, targetChatID)
+				editUsers(bot, update.CallbackQuery, targetChatID)
+				continue
 			}
 			// if strings.HasPrefix(data, "chat_") {
 			// 	bot.Send(tgbotapi.NewMessage(
@@ -1006,6 +1016,7 @@ func main() {
 				userID, _ := strconv.ParseInt(parts[2], 10, 64)
 
 				editUserControls(bot, update.CallbackQuery, targetChatID, userID)
+				continue
 			}
 
 			if strings.HasPrefix(data, "back_") {
@@ -1013,7 +1024,8 @@ func main() {
 
 				targetChatID, _ := strconv.ParseInt(parts[1], 10, 64)
 
-				showUsers(bot, update.CallbackQuery.Message.Chat.ID, targetChatID)
+				editUsers(bot, update.CallbackQuery, targetChatID)
+				continue
 			}
 
 			if strings.HasPrefix(data, "deladmin_") {
@@ -1040,12 +1052,8 @@ func main() {
 
 				clearStatisticsAndResetTime(targetChatID)
 
-				bot.Send(tgbotapi.NewMessage(
-					update.CallbackQuery.Message.Chat.ID,
-					fmt.Sprintf("Статистика сброшена для чата %d", targetChatID),
-				))
-
-				showUsers(bot, update.CallbackQuery.Message.Chat.ID, targetChatID)
+				text, buttons := buildUsersView(targetChatID)
+				editAdminMessage(bot, update.CallbackQuery, text+"\n\nСтатистика сброшена.", buttons)
 				continue
 			}
 
@@ -1055,12 +1063,8 @@ func main() {
 
 				resetPidorTimer(targetChatID)
 
-				bot.Send(tgbotapi.NewMessage(
-					update.CallbackQuery.Message.Chat.ID,
-					fmt.Sprintf("Таймер обнулён для чата %d", targetChatID),
-				))
-
-				showUsers(bot, update.CallbackQuery.Message.Chat.ID, targetChatID)
+				text, buttons := buildUsersView(targetChatID)
+				editAdminMessage(bot, update.CallbackQuery, text+"\n\nТаймер обнулён.", buttons)
 				continue
 			}
 
@@ -1148,12 +1152,15 @@ func main() {
 
 				if action == "add" {
 
-					// 👉 сохраняем состояние (что ждём ввод)
-					setPendingInput(update.CallbackQuery.From.ID, targetChatID, userID)
-					bot.Send(tgbotapi.NewMessage(
+					setPendingInput(
+						update.CallbackQuery.From.ID,
+						targetChatID,
+						userID,
 						update.CallbackQuery.Message.Chat.ID,
-						"Введи новый вес числом:",
-					))
+						update.CallbackQuery.Message.MessageID,
+					)
+					text, buttons := buildUserControlsView(targetChatID, userID, "Введи новый вес числом.")
+					editAdminMessage(bot, update.CallbackQuery, text, buttons)
 					continue
 				}
 
@@ -1191,20 +1198,36 @@ func main() {
 
 			value, err := strconv.Atoi(update.Message.Text)
 			if err != nil {
-				bot.Send(tgbotapi.NewMessage(chatID, "Введи нормальное число"))
+				editUserControlsByID(
+					bot,
+					pending.AdminChatID,
+					pending.MessageID,
+					pending.TargetChatID,
+					pending.UserID,
+					"Введи нормальное число.",
+				)
 				continue
+			}
+			if value < 1 {
+				value = 1
 			}
 			_, err = db.Exec(
 				"UPDATE participants SET weight = ? WHERE chat_id = ? AND user_id = ?",
-				value, pending.ChatID, pending.UserID,
+				value, pending.TargetChatID, pending.UserID,
 			)
 			if err != nil {
 				log.Println(err)
 				continue
 			}
 			delete(pendingInputs, userID)
-			bot.Send(tgbotapi.NewMessage(chatID, "Done"))
-			showUsers(bot, chatID, pending.ChatID)
+			editUserControlsByID(
+				bot,
+				pending.AdminChatID,
+				pending.MessageID,
+				pending.TargetChatID,
+				pending.UserID,
+				"Вес обновлён.",
+			)
 			continue
 		}
 
