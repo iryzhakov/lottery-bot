@@ -851,11 +851,25 @@ func editUserControls(bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery, ta
 		pauseAction = "start"
 	}
 
+	var winsCount int
+
+	err = db.QueryRow(
+		"SELECT COUNT(*) FROM results WHERE chat_id = ? AND user_id = ?",
+		targetChatID,
+		userID,
+	).Scan(&winsCount)
+
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
 	text := fmt.Sprintf(
-		"%s\nID: %d\nВес: %d\nСтатус: %s",
+		"%s\nID: %d\nВес: %d\nПобед: %d\nСтатус: %s",
 		formatMention(userID, username),
 		userID,
 		weight,
+		winsCount,
 		statusText,
 	)
 
@@ -867,6 +881,10 @@ func editUserControls(bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery, ta
 		{
 			tgbotapi.NewInlineKeyboardButtonData("-10", fmt.Sprintf("weight_%d_%d_-10", targetChatID, userID)),
 			tgbotapi.NewInlineKeyboardButtonData("-1", fmt.Sprintf("weight_%d_%d_-1", targetChatID, userID)),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("-1 победа", fmt.Sprintf("wins_%d_%d_-1", targetChatID, userID)),
+			tgbotapi.NewInlineKeyboardButtonData("+1 победа", fmt.Sprintf("wins_%d_%d_1", targetChatID, userID)),
 		},
 		{
 			tgbotapi.NewInlineKeyboardButtonData("Сброс", fmt.Sprintf("weight_%d_%d_reset", targetChatID, userID)),
@@ -1063,6 +1081,53 @@ func main() {
 		SET is_paused = ? 
 		WHERE chat_id = ? AND user_id = ?
 	`, isPaused, targetChatID, userID)
+
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+
+				editUserControls(bot, update.CallbackQuery, targetChatID, userID)
+				continue
+			}
+
+			if strings.HasPrefix(data, "wins_") {
+				parts := strings.Split(data, "_")
+
+				targetChatID, _ := strconv.ParseInt(parts[1], 10, 64)
+				userID, _ := strconv.ParseInt(parts[2], 10, 64)
+				delta, _ := strconv.Atoi(parts[3])
+
+				var username string
+
+				err := db.QueryRow(
+					"SELECT username FROM participants WHERE chat_id = ? AND user_id = ?",
+					targetChatID,
+					userID,
+				).Scan(&username)
+
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+
+				if delta > 0 {
+					_, err = db.Exec(`
+			INSERT INTO results (chat_id, user_id, username)
+			VALUES (?, ?, ?)
+		`, targetChatID, userID, username)
+				} else {
+					_, err = db.Exec(`
+			DELETE FROM results
+			WHERE id = (
+				SELECT id
+				FROM results
+				WHERE chat_id = ? AND user_id = ?
+				ORDER BY date DESC, id DESC
+				LIMIT 1
+			)
+		`, targetChatID, userID)
+				}
 
 				if err != nil {
 					log.Println(err)
