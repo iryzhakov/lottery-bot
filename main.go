@@ -905,7 +905,7 @@ func main() {
 	// }
 	err := godotenv.Load(envPath)
 	if err != nil {
-		log.Fatal("Failed to load .env file at:", envPath, "error:", err)
+		log.Println("No .env file found, using environment variables")
 	}
 
 	token := os.Getenv("BOT_TOKEN")
