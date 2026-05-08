@@ -191,17 +191,17 @@ func isNumeric(s string) bool {
 	return true
 }
 
-func formatMention(name string) string {
-	if name == "" {
-		return ""
+func formatMention(userID int64, username string) string {
+	if username == "" {
+		return fmt.Sprintf("[user](tg://user?id=%d)", userID)
 	}
-	if strings.HasPrefix(name, "@") {
-		return name
+	if strings.HasPrefix(username, "@") {
+		return username
 	}
-	if strings.Contains(name, " ") || isNumeric(name) {
-		return name
+	if strings.Contains(username, " ") || isNumeric(username) {
+		return fmt.Sprintf("[%s](tg://user?id=%d)", username, userID)
 	}
-	return "@" + name
+	return "@" + username
 }
 
 // func getRandomParticipant(chatID int64) (int64, string) {
@@ -317,7 +317,7 @@ func getParticipants(chatID int64) string {
 		if err != nil {
 			log.Fatal(err)
 		}
-		users += formatMention(username) + "\n"
+		users += formatMention(0, username) + "\n"
 	}
 	if users == "" {
 		return "Нет зарегистрированных участников."
@@ -642,7 +642,7 @@ func showUsers(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64) { // По
 		}
 
 		btn := tgbotapi.NewInlineKeyboardButtonData(
-			fmt.Sprintf("%s (вес: %d, %s)", formatMention(username), weight, status),
+			fmt.Sprintf("%s (вес: %d, %s)", formatMention(userID, username), weight, status),
 			fmt.Sprintf("user_%d_%d", targetChatID, userID),
 		)
 
@@ -699,7 +699,7 @@ func showUserControls(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64, us
 
 	text := fmt.Sprintf(
 		"%s\nID: %d\nВес: %d\nСтатус: %s",
-		formatMention(username),
+		formatMention(userID, username),
 		userID,
 		weight,
 		statusText,
@@ -853,7 +853,7 @@ func editUserControls(bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery, ta
 
 	text := fmt.Sprintf(
 		"%s\nID: %d\nВес: %d\nСтатус: %s",
-		formatMention(username),
+		formatMention(userID, username),
 		userID,
 		weight,
 		statusText,
@@ -905,7 +905,7 @@ func main() {
 	// }
 	err := godotenv.Load(envPath)
 	if err != nil {
-		log.Println("No .env file found, using environment variables")
+		log.Fatal("Failed to load .env file at:", envPath, "error:", err)
 	}
 
 	token := os.Getenv("BOT_TOKEN")
@@ -1438,13 +1438,13 @@ func main() {
 
 				if userID != 0 {
 					recordResult(chatID, userID, username)
-					updateLastPidor(chatID, userID, formatMention(username))
+					updateLastPidor(chatID, userID, formatMention(userID, username))
 
 					msg := tgbotapi.NewMessage(chatID,
-						fmt.Sprintf("🔥 Сегодня пидор дня 🎉: %s!", formatMention(username)),
+						fmt.Sprintf("🔥 Сегодня пидор дня 🎉: %s!", formatMention(userID, username)),
 					)
 					bot.Send(msg)
-
+					msg.ParseMode = "Markdown"
 				} else {
 					msg := tgbotapi.NewMessage(chatID, "Нет зарегистрированных участников.")
 					bot.Send(msg)
