@@ -1396,6 +1396,9 @@ func main() {
 						lastPidorUsername,
 					),
 				)
+
+				msg.ParseMode = "Markdown"
+
 				bot.Send(msg)
 
 			} else {
@@ -1443,8 +1446,11 @@ func main() {
 					msg := tgbotapi.NewMessage(chatID,
 						fmt.Sprintf("🔥 Сегодня пидор дня 🎉: %s!", formatMention(userID, username)),
 					)
-					bot.Send(msg)
+
 					msg.ParseMode = "Markdown"
+
+					bot.Send(msg)
+
 				} else {
 					msg := tgbotapi.NewMessage(chatID, "Нет зарегистрированных участников.")
 					bot.Send(msg)
