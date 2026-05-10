@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
@@ -90,6 +91,7 @@ func initDB() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER NOT NULL,
         last_pidor_time TIMESTAMP,
+        last_pidor_user_id INTEGER NOT NULL DEFAULT 0,
         last_pidor_username TEXT,
         UNIQUE(chat_id)
     );
@@ -106,6 +108,7 @@ func initDB() {
 		"ALTER TABLE participants ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE results ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE pidor_time ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE pidor_time ADD COLUMN last_pidor_user_id INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE participants ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE participants ADD COLUMN weight INTEGER NOT NULL DEFAULT 1",
 		"ALTER TABLE participants ADD COLUMN is_paused INTEGER NOT NULL DEFAULT 0",
@@ -208,6 +211,47 @@ func formatMention(userID int64, username string) string {
 	return "@" + username
 }
 
+func utf16Length(text string) int {
+	return len(utf16.Encode([]rune(text)))
+}
+
+func appendUserMention(text *strings.Builder, entities *[]tgbotapi.MessageEntity, userID int64, username string) {
+	name := plainUserName(username)
+	if name == "" {
+		name = "user"
+	}
+
+	offset := utf16Length(text.String())
+	text.WriteString(name)
+
+	if userID == 0 {
+		return
+	}
+
+	*entities = append(*entities, tgbotapi.MessageEntity{
+		Type:   "text_mention",
+		Offset: offset,
+		Length: utf16Length(name),
+		User: &tgbotapi.User{
+			ID:        userID,
+			FirstName: name,
+		},
+	})
+}
+
+func newMentionMessage(chatID int64, prefix string, userID int64, username string, suffix string) tgbotapi.MessageConfig {
+	var text strings.Builder
+	var entities []tgbotapi.MessageEntity
+
+	text.WriteString(prefix)
+	appendUserMention(&text, &entities, userID, username)
+	text.WriteString(suffix)
+
+	msg := tgbotapi.NewMessage(chatID, text.String())
+	msg.Entities = entities
+	return msg
+}
+
 // func getRandomParticipant(chatID int64) (int64, string) {
 // 	rows, err := db.Query("SELECT user_id, username FROM participants WHERE chat_id = ? ORDER BY RANDOM() LIMIT 1", chatID)
 // 	if err != nil {
@@ -287,24 +331,42 @@ func recordResult(chatID int64, userID int64, username string) {
 	}
 }
 
-func getStatistics(chatID int64) string {
-	rows, err := db.Query("SELECT username, COUNT(*) as count FROM results WHERE chat_id = ? GROUP BY user_id, username ORDER BY count DESC", chatID)
+func buildStatisticsMessage(chatID int64) (string, []tgbotapi.MessageEntity) {
+	rows, err := db.Query(`
+		SELECT
+			r.user_id,
+			COALESCE(p.username, MAX(r.username)) AS username,
+			COUNT(*) AS count
+		FROM results r
+		LEFT JOIN participants p
+			ON p.chat_id = r.chat_id AND p.user_id = r.user_id
+		WHERE r.chat_id = ?
+		GROUP BY r.user_id, p.username
+		ORDER BY count DESC
+	`, chatID)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer rows.Close()
 
-	var stats string
+	var text strings.Builder
+	var entities []tgbotapi.MessageEntity
+
+	text.WriteString("🔥 Статистика пидоров дня 🎉:\n")
+
 	for rows.Next() {
+		var userID int64
 		var username string
 		var count int
-		err = rows.Scan(&username, &count)
+		err = rows.Scan(&userID, &username, &count)
 		if err != nil {
 			log.Fatal(err)
 		}
-		stats += fmt.Sprintf("%s: %d\n", username, count)
+		appendUserMention(&text, &entities, userID, username)
+		text.WriteString(fmt.Sprintf(": %d\n", count))
 	}
-	return stats
+
+	return strings.TrimRight(text.String(), "\n"), entities
 }
 
 func getParticipants(chatID int64) string {
@@ -335,7 +397,7 @@ func clearStatisticsAndResetTime(chatID int64) {
 		log.Fatal(err)
 	}
 	// обнуляем к хуям время последнего запуска на рандомную дату в прошлом, чтобы при первом запуске после очистки сразу можно было выбрать пидора дня
-	_, err = db.Exec("UPDATE pidor_time SET last_pidor_time = '1990-01-01 00:00:00', last_pidor_username = '' WHERE chat_id = ?", chatID)
+	_, err = db.Exec("UPDATE pidor_time SET last_pidor_time = '1990-01-01 00:00:00', last_pidor_user_id = 0, last_pidor_username = '' WHERE chat_id = ?", chatID)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -345,7 +407,7 @@ func clearStatisticsAndResetTime(chatID int64) {
 func resetPidorTimer(chatID int64) {
 	_, err := db.Exec(`
 		UPDATE pidor_time 
-		SET last_pidor_time = '1990-01-01 00:00:00', last_pidor_username = '' 
+		SET last_pidor_time = '1990-01-01 00:00:00', last_pidor_user_id = 0, last_pidor_username = '' 
 		WHERE chat_id = ?
 	`, chatID)
 
@@ -368,25 +430,42 @@ func deleteAllParticipants(chatID int64) {
 	}
 }
 
-func getLastPidor(chatID int64) (time.Time, string) {
+func getLastPidor(chatID int64) (time.Time, int64, string) {
 	var lastTime time.Time
+	var lastUserID int64
 	var lastUsername sql.NullString
-	err := db.QueryRow("SELECT last_pidor_time, last_pidor_username FROM pidor_time WHERE chat_id = ?", chatID).Scan(&lastTime, &lastUsername)
+	err := db.QueryRow("SELECT last_pidor_time, last_pidor_user_id, last_pidor_username FROM pidor_time WHERE chat_id = ?", chatID).Scan(&lastTime, &lastUserID, &lastUsername)
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	username := ""
 	if lastUsername.Valid {
-		return lastTime, lastUsername.String
+		username = lastUsername.String
 	}
-	return lastTime, ""
+
+	if lastUserID == 0 && username != "" {
+		cleanName := plainUserName(username)
+		err = db.QueryRow(`
+			SELECT user_id, username
+			FROM participants
+			WHERE chat_id = ? AND (username = ? OR username = ? OR username = ?)
+			LIMIT 1
+		`, chatID, username, cleanName, "@"+cleanName).Scan(&lastUserID, &username)
+		if err != nil && err != sql.ErrNoRows {
+			log.Println("Failed to resolve last pidor user:", err)
+		}
+	}
+
+	return lastTime, lastUserID, username
 }
 
 func updateLastPidor(chatID int64, userID int64, username string) {
-	stmt, err := db.Prepare("UPDATE pidor_time SET last_pidor_time = datetime('now'), last_pidor_username = ? WHERE chat_id = ?")
+	stmt, err := db.Prepare("UPDATE pidor_time SET last_pidor_time = datetime('now'), last_pidor_user_id = ?, last_pidor_username = ? WHERE chat_id = ?")
 	if err != nil {
 		log.Fatal(err)
 	}
-	_, err = stmt.Exec(username, chatID)
+	_, err = stmt.Exec(userID, username, chatID)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1465,7 +1544,7 @@ func main() {
 				continue
 			}
 
-			lastPidorTime, lastPidorUsername := getLastPidor(chatID)
+			lastPidorTime, lastPidorUserID, lastPidorUsername := getLastPidor(chatID)
 
 			loc, err := time.LoadLocation("Europe/Warsaw")
 			if err != nil {
@@ -1479,13 +1558,13 @@ func main() {
 			lastPidorDay := lastPidorTimeInLoc.Format("2006-01-02")
 
 			if currentDay == lastPidorDay {
-				msg := tgbotapi.NewMessage(chatID,
-					fmt.Sprintf("🔥🔥🔥 Сегодня пидор дня: %s!\nСледующий розыгрыш будет доступен завтра.",
-						lastPidorUsername,
-					),
+				msg := newMentionMessage(
+					chatID,
+					"🔥🔥🔥 Сегодня пидор дня: ",
+					lastPidorUserID,
+					lastPidorUsername,
+					"!\nСледующий розыгрыш будет доступен завтра.",
 				)
-
-				msg.ParseMode = "Markdown"
 
 				bot.Send(msg)
 
@@ -1529,13 +1608,15 @@ func main() {
 
 				if userID != 0 {
 					recordResult(chatID, userID, username)
-					updateLastPidor(chatID, userID, formatMention(userID, username))
+					updateLastPidor(chatID, userID, username)
 
-					msg := tgbotapi.NewMessage(chatID,
-						fmt.Sprintf("🔥 Сегодня пидор дня 🎉: %s!", formatMention(userID, username)),
+					msg := newMentionMessage(
+						chatID,
+						"🔥 Сегодня пидор дня 🎉: ",
+						userID,
+						username,
+						"!",
 					)
-
-					msg.ParseMode = "Markdown"
 
 					bot.Send(msg)
 
@@ -1550,8 +1631,9 @@ func main() {
 				continue
 			}
 
-			stats := getStatistics(chatID)
-			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔥 Статистика пидоров дня 🎉:\n%s", stats))
+			stats, entities := buildStatisticsMessage(chatID)
+			msg := tgbotapi.NewMessage(chatID, stats)
+			msg.Entities = entities
 			bot.Send(msg)
 
 		case "show_users":
