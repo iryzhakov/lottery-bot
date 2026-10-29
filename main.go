@@ -37,6 +37,43 @@ type pendingInput struct {
 
 var pendingInputs = make(map[int64]pendingInput)
 
+type pendingPhraseInput struct {
+	TargetChatID int64
+	PhraseID     int64
+	AdminChatID  int64
+	MessageID    int
+}
+
+var pendingPhraseInputs = make(map[int64]pendingPhraseInput)
+
+var defaultDrawPhrases = []string{
+	"Ищу пидора дня...",
+	"Советуюсь с коллегами...",
+	"Проверяю базу данных...",
+	"Анализирую участников...",
+	"Определяю судьбу...",
+	"Ищем самого мутного типа…",
+	"Сча вычислим, кто тут косячит…",
+	"Копаемся в ваших грешках…",
+	"Проверяем, кто сегодня накосячил…",
+	"Сканируем чат на долбоебизм…",
+	"Кто-то сегодня попал, чувствуем…",
+	"Сча найдём главного виновника…",
+	"Анализируем уровень кринжа…",
+	"Определяем, кто сегодня отличился по-плохому…",
+	"Проверяем, у кого сегодня минус карма…",
+	"Сча система выдаст самого подозрительного…",
+	"Кто сегодня словил неудачу, подождите…",
+	"Собираем доказательства против вас…",
+	"Перебираем список косяков…",
+	"Сча выберем самого ‘удачливого’…",
+	"Кто-то из вас сейчас огребёт…",
+	"Проверяем, кто нарывается…",
+	"Секундочку, почти вычислили…",
+	"Сча рандом решит вашу судьбу…",
+	"Готовьтесь, сейчас будет больно…",
+}
+
 func getAppDir() string {
 	ex, err := os.Executable()
 	if err != nil {
@@ -96,7 +133,12 @@ func initDB() {
         UNIQUE(chat_id)
     );
 	CREATE TABLE IF NOT EXISTS admins (
-    user_id INTEGER PRIMARY KEY);`
+	user_id INTEGER PRIMARY KEY);
+
+	CREATE TABLE IF NOT EXISTS draw_phrases (
+	    id INTEGER PRIMARY KEY AUTOINCREMENT,
+	    phrase TEXT NOT NULL
+	);`
 
 	_, err = db.Exec(createTableQuery)
 	if err != nil {
@@ -118,6 +160,27 @@ func initDB() {
 		_, err = db.Exec(query)
 		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			log.Fatal(err)
+		}
+	}
+
+	var phraseCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM draw_phrases").Scan(&phraseCount)
+	if err != nil {
+		log.Fatal("Failed to count draw phrases:", err)
+	}
+	if phraseCount == 0 {
+		tx, err := db.Begin()
+		if err != nil {
+			log.Fatal("Failed to initialize draw phrases:", err)
+		}
+		for _, phrase := range defaultDrawPhrases {
+			if _, err := tx.Exec("INSERT INTO draw_phrases (phrase) VALUES (?)", phrase); err != nil {
+				tx.Rollback()
+				log.Fatal("Failed to initialize draw phrases:", err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			log.Fatal("Failed to initialize draw phrases:", err)
 		}
 	}
 
@@ -414,6 +477,30 @@ func resetPidorTimer(chatID int64) {
 	if err != nil {
 		log.Println("Failed to reset timer:", err)
 	}
+}
+
+func getDrawPhrases() ([]string, error) {
+	rows, err := db.Query("SELECT phrase FROM draw_phrases ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var phrases []string
+	for rows.Next() {
+		var phrase string
+		if err := rows.Scan(&phrase); err != nil {
+			return nil, err
+		}
+		phrases = append(phrases, phrase)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(phrases) == 0 {
+		return nil, fmt.Errorf("draw phrase list is empty")
+	}
+	return phrases, nil
 }
 
 func deleteParticipant(chatID int64, userID int64) {
@@ -797,10 +884,16 @@ func buildUsersView(targetChatID int64) (string, [][]tgbotapi.InlineKeyboardButt
 		fmt.Sprintf("reset_timer_%d", targetChatID),
 	)
 
+	phrasesBtn := tgbotapi.NewInlineKeyboardButtonData(
+		"💬 Фразы",
+		fmt.Sprintf("phrases_%d", targetChatID),
+	)
+
 	backBtn := tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "goback")
 
 	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(clearStatsBtn))
 	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(resetTimerBtn))
+	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(phrasesBtn))
 	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(backBtn))
 
 	return fmt.Sprintf("Чат %d\nВыбери участника:", targetChatID), buttons
@@ -813,6 +906,66 @@ func showUsers(bot *tgbotapi.BotAPI, chatID int64, targetChatID int64) { // По
 
 func editUsers(bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery, targetChatID int64) {
 	text, buttons := buildUsersView(targetChatID)
+	editAdminMessage(bot, callback, text, buttons)
+}
+
+func buildPhrasesView(targetChatID int64, notice string) (string, [][]tgbotapi.InlineKeyboardButton, error) {
+	rows, err := db.Query("SELECT id, phrase FROM draw_phrases ORDER BY id")
+	if err != nil {
+		return "", nil, err
+	}
+	defer rows.Close()
+
+	var text strings.Builder
+	text.WriteString("Фразы для розыгрыша (общие для всех чатов):\n")
+	if notice != "" {
+		text.WriteString("\n")
+		text.WriteString(notice)
+		text.WriteString("\n")
+	}
+
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	index := 0
+	for rows.Next() {
+		var phraseID int64
+		var phrase string
+		if err := rows.Scan(&phraseID, &phrase); err != nil {
+			return "", nil, err
+		}
+
+		index++
+		fmt.Fprintf(&text, "%d. %s\n", index, phrase)
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				fmt.Sprintf("✏️ Изменить %d", index),
+				fmt.Sprintf("phrase_edit_%d_%d", targetChatID, phraseID),
+			),
+		))
+	}
+	if err := rows.Err(); err != nil {
+		return "", nil, err
+	}
+	if index == 0 {
+		text.WriteString("\nСписок пуст.")
+	}
+
+	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("➕ Добавить фразу", fmt.Sprintf("phrase_add_%d", targetChatID)),
+	))
+	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", fmt.Sprintf("phrases_back_%d", targetChatID)),
+	))
+
+	return text.String(), buttons, nil
+}
+
+func editPhrases(bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery, targetChatID int64, notice string) {
+	text, buttons, err := buildPhrasesView(targetChatID, notice)
+	if err != nil {
+		log.Println("Failed to load draw phrases:", err)
+		editAdminMessage(bot, callback, "Не удалось загрузить список фраз.", nil)
+		return
+	}
 	editAdminMessage(bot, callback, text, buttons)
 }
 
@@ -1107,6 +1260,108 @@ func main() {
 				continue
 			}
 
+			if strings.HasPrefix(data, "phrases_back_") {
+				parts := strings.Split(data, "_")
+				if len(parts) != 3 {
+					log.Println("Invalid phrases back callback:", data)
+					continue
+				}
+				targetChatID, err := strconv.ParseInt(parts[2], 10, 64)
+				if err != nil {
+					log.Println("Invalid phrases back callback:", err)
+					continue
+				}
+				editUsers(bot, update.CallbackQuery, targetChatID)
+				continue
+			}
+
+			if strings.HasPrefix(data, "phrases_cancel_") {
+				parts := strings.Split(data, "_")
+				if len(parts) != 3 {
+					log.Println("Invalid phrases cancel callback:", data)
+					continue
+				}
+				targetChatID, err := strconv.ParseInt(parts[2], 10, 64)
+				if err != nil {
+					log.Println("Invalid phrases cancel callback:", err)
+					continue
+				}
+				delete(pendingPhraseInputs, update.CallbackQuery.From.ID)
+				editPhrases(bot, update.CallbackQuery, targetChatID, "")
+				continue
+			}
+
+			if strings.HasPrefix(data, "phrases_") {
+				parts := strings.Split(data, "_")
+				if len(parts) != 2 {
+					log.Println("Invalid phrases callback:", data)
+					continue
+				}
+				targetChatID, err := strconv.ParseInt(parts[1], 10, 64)
+				if err != nil {
+					log.Println("Invalid phrases callback:", err)
+					continue
+				}
+				editPhrases(bot, update.CallbackQuery, targetChatID, "")
+				continue
+			}
+
+			if strings.HasPrefix(data, "phrase_add_") {
+				parts := strings.Split(data, "_")
+				if len(parts) != 3 {
+					log.Println("Invalid add phrase callback:", data)
+					continue
+				}
+				targetChatID, err := strconv.ParseInt(parts[2], 10, 64)
+				if err != nil {
+					log.Println("Invalid add phrase callback:", err)
+					continue
+				}
+
+				delete(pendingInputs, update.CallbackQuery.From.ID)
+				pendingPhraseInputs[update.CallbackQuery.From.ID] = pendingPhraseInput{
+					TargetChatID: targetChatID,
+					AdminChatID:  update.CallbackQuery.Message.Chat.ID,
+					MessageID:    update.CallbackQuery.Message.MessageID,
+				}
+				cancelButton := tgbotapi.NewInlineKeyboardButtonData("⬅️ Отмена", fmt.Sprintf("phrases_cancel_%d", targetChatID))
+				editAdminMessage(bot, update.CallbackQuery, "Отправь новую фразу одним сообщением.", [][]tgbotapi.InlineKeyboardButton{
+					tgbotapi.NewInlineKeyboardRow(cancelButton),
+				})
+				continue
+			}
+
+			if strings.HasPrefix(data, "phrase_edit_") {
+				parts := strings.Split(data, "_")
+				if len(parts) != 4 {
+					log.Println("Invalid edit phrase callback:", data)
+					continue
+				}
+				targetChatID, err := strconv.ParseInt(parts[2], 10, 64)
+				if err != nil {
+					log.Println("Invalid edit phrase chat ID:", err)
+					continue
+				}
+				phraseID, err := strconv.ParseInt(parts[3], 10, 64)
+				if err != nil {
+					log.Println("Invalid edit phrase ID:", err)
+					continue
+				}
+
+				delete(pendingInputs, update.CallbackQuery.From.ID)
+				pendingPhraseInputs[update.CallbackQuery.From.ID] = pendingPhraseInput{
+					TargetChatID: targetChatID,
+					PhraseID:     phraseID,
+					AdminChatID:  update.CallbackQuery.Message.Chat.ID,
+					MessageID:    update.CallbackQuery.Message.MessageID,
+				}
+				cancelButton := tgbotapi.NewInlineKeyboardButtonData("⬅️ Отмена", fmt.Sprintf("phrases_cancel_%d", targetChatID))
+				editAdminMessage(bot, update.CallbackQuery, "Отправь новый текст фразы одним сообщением.", [][]tgbotapi.InlineKeyboardButton{
+					tgbotapi.NewInlineKeyboardRow(cancelButton),
+				})
+				continue
+			}
+
 			if strings.HasPrefix(data, "deladmin_") {
 				parts := strings.Split(data, "_")
 				adminID, _ := strconv.ParseInt(parts[1], 10, 64)
@@ -1273,6 +1528,47 @@ func main() {
 		if isGroupChat(update.Message) {
 			autoRegisterParticipant(chatID, update.Message.From)
 		}
+		if pending, ok := pendingPhraseInputs[userID]; ok {
+			phrase := strings.TrimSpace(update.Message.Text)
+			if phrase == "" {
+				cancelButton := tgbotapi.NewInlineKeyboardButtonData("⬅️ Отмена", fmt.Sprintf("phrases_cancel_%d", pending.TargetChatID))
+				editAdminMessageByID(bot, pending.AdminChatID, pending.MessageID, "Фраза не может быть пустой. Отправь текст ещё раз.", [][]tgbotapi.InlineKeyboardButton{
+					tgbotapi.NewInlineKeyboardRow(cancelButton),
+				})
+				continue
+			}
+
+			var result sql.Result
+			var err error
+			if pending.PhraseID == 0 {
+				result, err = db.Exec("INSERT INTO draw_phrases (phrase) VALUES (?)", phrase)
+			} else {
+				result, err = db.Exec("UPDATE draw_phrases SET phrase = ? WHERE id = ?", phrase, pending.PhraseID)
+			}
+			if err == nil && pending.PhraseID != 0 {
+				var affected int64
+				affected, err = result.RowsAffected()
+				if err == nil && affected == 0 {
+					err = fmt.Errorf("draw phrase %d no longer exists", pending.PhraseID)
+				}
+			}
+			if err != nil {
+				log.Println("Failed to save draw phrase:", err)
+				bot.Send(tgbotapi.NewMessage(chatID, "Не удалось сохранить фразу. Попробуй ещё раз или отмени действие."))
+				continue
+			}
+
+			delete(pendingPhraseInputs, userID)
+			text, buttons, err := buildPhrasesView(pending.TargetChatID, "Фраза сохранена.")
+			if err != nil {
+				log.Println("Failed to reload draw phrases:", err)
+				editAdminMessageByID(bot, pending.AdminChatID, pending.MessageID, "Фраза сохранена, но список не удалось загрузить.", nil)
+				continue
+			}
+			editAdminMessageByID(bot, pending.AdminChatID, pending.MessageID, text, buttons)
+			continue
+		}
+
 		if pending, ok := pendingInputs[userID]; ok {
 
 			value, err := strconv.Atoi(update.Message.Text)
@@ -1569,32 +1865,11 @@ func main() {
 				bot.Send(msg)
 
 			} else {
-				phrases := []string{
-					"Ищу пидора дня...",
-					"Советуюсь с коллегами...",
-					"Проверяю базу данных...",
-					"Анализирую участников...",
-					"Определяю судьбу...",
-					"Ищем самого мутного типа…",
-					"Сча вычислим, кто тут косячит…",
-					"Копаемся в ваших грешках…",
-					"Проверяем, кто сегодня накосячил…",
-					"Сканируем чат на долбоебизм…",
-					"Кто-то сегодня попал, чувствуем…",
-					"Сча найдём главного виновника…",
-					"Анализируем уровень кринжа…",
-					"Определяем, кто сегодня отличился по-плохому…",
-					"Проверяем, у кого сегодня минус карма…",
-					"Сча система выдаст самого подозрительного…",
-					"Кто сегодня словил неудачу, подождите…",
-					"Собираем доказательства против вас…",
-					"Перебираем список косяков…",
-					"Сча выберем самого ‘удачливого’…",
-					"Кто-то из вас сейчас огребёт…",
-					"Проверяем, кто нарывается…",
-					"Секундочку, почти вычислили…",
-					"Сча рандом решит вашу судьбу…",
-					"Готовьтесь, сейчас будет больно…",
+				phrases, err := getDrawPhrases()
+				if err != nil {
+					log.Println("Failed to load draw phrases:", err)
+					bot.Send(tgbotapi.NewMessage(chatID, "Не удалось загрузить фразы для розыгрыша."))
+					continue
 				}
 
 				for i := 0; i < 5; i++ {
